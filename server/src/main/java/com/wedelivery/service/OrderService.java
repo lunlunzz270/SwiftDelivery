@@ -45,6 +45,7 @@ public class OrderService {
     private final RouteService routeService;
     private final OrderReviewRepository orderReviewRepository;
     private final UserRepository userRepository;
+    private final RedisDistributedLockService redisDistributedLockService;
 
     // Tracking code alphabet: excludes ambiguous 0/O, 1/I (32 characters; 16 chars ≈ 80 bits entropy)
     private static final String TRACKING_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -150,13 +151,35 @@ public class OrderService {
                     + " at station " + matchedPlan.getStationName() + ". Please retry or select another plan.");
         }
 
-        Vehicle lockedVehicle = availableVehicles.get(0);
-        log.info("Locked vehicle: {} (ID: {})", lockedVehicle.getVehicleCode(), lockedVehicle.getId());
+        // Atomically acquire Redis distributed lock to prevent double-allocation races during concurrent dispatches
+        Vehicle lockedVehicle = null;
+        String acquiredLockKey = null;
+        String acquiredLockToken = null;
 
-        // 5. Generate unique system order number and secure tracking code
-        String orderNumber = "SFORD" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"))
-                + String.format("%03d", ThreadLocalRandom.current().nextInt(1000));
-        String trackingCode = generateTrackingCode();
+        for (Vehicle candidate : availableVehicles) {
+            String lockKey = "lock:vehicle:" + candidate.getVehicleCode();
+            String token = redisDistributedLockService.tryAcquireLock(lockKey, 8000);
+            if (token != null) {
+                lockedVehicle = candidate;
+                acquiredLockKey = lockKey;
+                acquiredLockToken = token;
+                log.info("[RedisLock] Secured atomic distributed lock for vehicle: {}", candidate.getVehicleCode());
+                break;
+            }
+        }
+
+        if (lockedVehicle == null) {
+            throw new NoVehicleAvailableException("Peak dispatch contention: candidate vehicles at station "
+                    + matchedPlan.getStationName() + " are currently being locked by concurrent orders. Please retry.");
+        }
+
+        try {
+            log.info("Locked vehicle: {} (ID: {})", lockedVehicle.getVehicleCode(), lockedVehicle.getId());
+
+            // 5. Generate unique system order number and secure tracking code
+            String orderNumber = "SFORD" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"))
+                    + String.format("%03d", ThreadLocalRandom.current().nextInt(1000));
+            String trackingCode = generateTrackingCode();
 
         Order order = Order.builder()
                 .orderNumber(orderNumber)
@@ -243,6 +266,11 @@ public class OrderService {
                 .assignedVehicleCode(lockedVehicle.getVehicleCode())
                 .message("Order created and vehicle locked successfully.")
                 .build();
+        } finally {
+            if (acquiredLockKey != null && acquiredLockToken != null) {
+                redisDistributedLockService.releaseLock(acquiredLockKey, acquiredLockToken);
+            }
+        }
     }
 
     /**

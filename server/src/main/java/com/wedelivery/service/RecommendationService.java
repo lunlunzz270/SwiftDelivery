@@ -53,6 +53,7 @@ public class RecommendationService {
     private final StationRepository stationRepository;
     private final VehicleRepository vehicleRepository;
     private final RouteService routeService;
+    private final RouteQuoteCacheService routeQuoteCacheService;
 
     /** 派单候选状态：待命与充电中的载具都可被抽调。 */
     public static final List<VehicleStatus> DISPATCHABLE_STATUSES =
@@ -107,6 +108,15 @@ public class RecommendationService {
 
     public QuoteResponse generateRecommendations(QuoteRequest request, User currentUser) {
         boolean isVip = currentUser != null && currentUser.isVip();
+
+        // Cache-Aside: Check Redis cache first to avoid redundant OSRM/Haversine computation
+        String cacheKey = routeQuoteCacheService.generateCacheKey(request) + (isVip ? ":vip" : ":std");
+        QuoteResponse cached = routeQuoteCacheService.getCachedQuote(cacheKey);
+        if (cached != null) {
+            log.info("[RedisCache-Aside] Returning cached routing quote for key={}", cacheKey);
+            return cached;
+        }
+
         List<Station> stations = stationRepository.findAll();
         List<PlanOptionDto> options = new ArrayList<>();
 
@@ -139,11 +149,15 @@ public class RecommendationService {
         }
 
         log.info("Recommendation generated: {} plan(s)", options.size());
-        return QuoteResponse.builder()
+        QuoteResponse response = QuoteResponse.builder()
                 .plans(options)
                 .isVipUser(isVip)
                 .vipDiscountRate(isVip ? VIP_DISCOUNT_RATE : BigDecimal.ZERO)
                 .build();
+
+        // Cache-Aside: Write computed quote into Redis with TTL
+        routeQuoteCacheService.putCachedQuote(cacheKey, response);
+        return response;
     }
 
     /**

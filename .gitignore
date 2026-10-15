@@ -42,3 +42,13 @@ e2e/screenshots/
 # Postman app local workspace files (per-user, not project content)
 postman/.postman/
 postman/postman/
+
+# Large Media & Presentation Binaries (Hosted on Google Drive)
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.pptx
+docs/*.mp4
+docs/*.mov
+docs/*.pptx
